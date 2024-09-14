@@ -19,7 +19,7 @@ func NewEncoder() *Encoder {
 
 func (e *Encoder) Write(b byte, p uint8) {
 	for i := range 8 {
-		bv := ((b >> i) & 1) == 1
+		bv := ((b << i) & 128) == 128
 
 		split := 1 + (((e.Range - 1) * uint32(p)) >> 8)
 

@@ -16,7 +16,7 @@ func TestDecode(t *testing.T) {
 	}
 	defer f.Close()
 
-	riffHeader, vp8Header, err := gowebp.Decode(f)
+	riffHeader, vp8Header, vp8FrameHeader, err := gowebp.Decode(f)
 	if err != nil {
 		t.Errorf("Error decoding WebP file: %v", err)
 	}
@@ -36,5 +36,11 @@ func TestDecode(t *testing.T) {
 		t.Errorf("Invalid height: expected %d, got %d", 700, vp8Header.Height)
 	}
 
-	println(vp8Header.PartSize)
+	if !vp8FrameHeader.UseSegment {
+		t.Errorf("Invalid use_segment: expected %t, got %t", true, vp8FrameHeader.UseSegment)
+	}
+
+	if vp8FrameHeader.Partitions != 1 {
+		t.Errorf("Invalid partitions: expected %d, got %d", 1, vp8FrameHeader.Partitions)
+	}
 }

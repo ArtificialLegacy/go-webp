@@ -2,7 +2,7 @@ package compression
 
 type Decoder struct {
 	Input []byte
-	pos   int
+	Pos   int
 
 	Range    uint32
 	Value    uint32
@@ -17,20 +17,36 @@ func NewDecoder(input []byte) *Decoder {
 	return &Decoder{
 		Input: input,
 		Range: 255,
-		pos:   2,
+		Pos:   2,
 		Value: (uint32(input[0]) << 8) | uint32(input[1]),
 	}
 }
 
-func (d *Decoder) Read(bitCount int, prob uint8) uint32 {
+func (d *Decoder) ReadProb(bitCount int, prob uint8) uint32 {
 	v := uint32(0)
-	bc := bitCount - 1
+	/*bc := bitCount - 1
 
 	for ; bitCount > 0; bitCount-- {
 		v = (v >> 1) + (d.read(prob) << uint32(bc))
+	}*/
+
+	for ; bitCount > 0; bitCount-- {
+		v = (v << 1) + d.read(prob)
 	}
 
 	return v
+}
+
+func (d *Decoder) Read(bitCount int) uint32 {
+	return d.ReadProb(bitCount, 128)
+}
+
+func (d *Decoder) Read8(bitCount int) uint8 {
+	return uint8(d.ReadProb(bitCount, 128))
+}
+
+func (d *Decoder) ReadFlag() bool {
+	return d.ReadProb(1, 128) == 1
 }
 
 func (d *Decoder) read(p uint8) uint32 {
@@ -55,8 +71,8 @@ func (d *Decoder) read(p uint8) uint32 {
 		d.BitCount++
 		if d.BitCount == 8 {
 			d.BitCount = 0
-			d.Value |= uint32(d.Input[d.pos])
-			d.pos++
+			d.Value |= uint32(d.Input[d.Pos])
+			d.Pos++
 		}
 	}
 
