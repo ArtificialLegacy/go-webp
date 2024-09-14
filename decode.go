@@ -104,7 +104,7 @@ const (
 )
 
 func decodeVP8FrameHeader(r io.Reader) (*VP8Header, error) {
-	header := make([]byte, 4)
+	header := make([]byte, 12)
 	n, err := r.Read(header[0:3])
 	if err != nil {
 		return nil, NewFormatErrorf("error reading VP8 frame header: %v", err)
@@ -113,7 +113,7 @@ func decodeVP8FrameHeader(r io.Reader) (*VP8Header, error) {
 		return nil, NewFormatErrorf("invalid VP8 frame header: expected %d bytes, got %d", 3, n)
 	}
 
-	data := binary.LittleEndian.Uint32(header)
+	data := binary.LittleEndian.Uint32(header[0:4])
 
 	keyFrame := data & 0x1
 	version := (data >> 1) & 0x7
@@ -127,8 +127,7 @@ func decodeVP8FrameHeader(r io.Reader) (*VP8Header, error) {
 		return nil, NewFormatError("invalid VP8 frame header: frame must be shown")
 	}
 
-	startCodeRead := make([]byte, 4)
-	n, err = r.Read(startCodeRead[1:4])
+	n, err = r.Read(header[5:8])
 	if err != nil {
 		return nil, NewFormatErrorf("error reading VP8 frame header: %v", err)
 	}
@@ -136,13 +135,12 @@ func decodeVP8FrameHeader(r io.Reader) (*VP8Header, error) {
 		return nil, NewFormatErrorf("invalid VP8 frame header: expected %d bytes, got %d", 3, n)
 	}
 
-	startCode := binary.BigEndian.Uint32(startCodeRead)
+	startCode := binary.BigEndian.Uint32(header[4:8])
 	if startCode != START_CODE {
 		return nil, NewFormatErrorf("invalid start code: expected %d, got %d", START_CODE, startCode)
 	}
 
-	scale := make([]byte, 4)
-	n, err = r.Read(scale)
+	n, err = r.Read(header[8:12])
 	if err != nil {
 		return nil, NewFormatErrorf("error reading VP8 frame header: %v", err)
 	}
@@ -150,8 +148,8 @@ func decodeVP8FrameHeader(r io.Reader) (*VP8Header, error) {
 		return nil, NewFormatErrorf("invalid VP8 frame header: expected %d bytes, got %d", 4, n)
 	}
 
-	width := binary.LittleEndian.Uint16(scale[0:2])
-	height := binary.LittleEndian.Uint16(scale[2:4])
+	width := binary.LittleEndian.Uint16(header[8:10])
+	height := binary.LittleEndian.Uint16(header[10:12])
 
 	h := &VP8Header{
 		Version:  uint8(version),
