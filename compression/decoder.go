@@ -45,8 +45,16 @@ func (d *Decoder) Read8(bitCount int) uint8 {
 	return uint8(d.ReadProb(bitCount, 128))
 }
 
+func (d *Decoder) Read8Prob(bitCount int, prob uint8) uint8 {
+	return uint8(d.ReadProb(bitCount, prob))
+}
+
 func (d *Decoder) ReadFlag() bool {
 	return d.ReadProb(1, 128) == 1
+}
+
+func (d *Decoder) ReadFlagProb(prob uint8) bool {
+	return d.ReadProb(1, prob) == 1
 }
 
 func (d *Decoder) read(p uint8) uint32 {
