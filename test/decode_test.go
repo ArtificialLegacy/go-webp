@@ -1,6 +1,7 @@
 package test
 
 import (
+	"image/png"
 	"os"
 	"testing"
 
@@ -16,7 +17,7 @@ func TestDecode(t *testing.T) {
 	}
 	defer f.Close()
 
-	riffHeader, vp8Header, vp8FrameHeader, err := gowebp.Decode(f)
+	riffHeader, vp8Header, vp8FrameHeader, img, err := gowebp.Decode(f)
 	if err != nil {
 		t.Errorf("Error decoding WebP file: %v", err)
 	}
@@ -43,4 +44,12 @@ func TestDecode(t *testing.T) {
 	if vp8FrameHeader.Partitions != 1 {
 		t.Errorf("Invalid partitions: expected %d, got %d", 1, vp8FrameHeader.Partitions)
 	}
+
+	fpng, err := os.OpenFile("test.png", os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o666)
+	if err != nil {
+		t.Error(err)
+	}
+	defer fpng.Close()
+
+	png.Encode(fpng, img)
 }

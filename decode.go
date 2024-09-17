@@ -3,8 +3,8 @@ package gowebp
 import (
 	"encoding/binary"
 	"fmt"
+	"image"
 	"io"
-	"math"
 
 	"github.com/ArtificialLegacy/go-webp/compression"
 )
@@ -42,21 +42,25 @@ type decoder struct {
 
 	r io.Reader
 
-	vp8 *VP8Header
-	fc  *VP8FrameHeader
+	vp8      *VP8Header
+	fc       *VP8FrameHeader
+	nzDCMask uint32
+	nzACMask uint32
+
+	img *image.YCbCr
 }
 
-func Decode(r io.Reader) (*RIFFHeader, *VP8Header, *VP8FrameHeader, error) {
+func Decode(r io.Reader) (*RIFFHeader, *VP8Header, *VP8FrameHeader, image.Image, error) {
 	decoder := decoder{r: r}
 
 	riffHeader, err := decodeRiffHeader(r)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	vp8Header, err := decoder.decodeVP8Header(r)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	decoder.vp8 = vp8Header
@@ -64,14 +68,14 @@ func Decode(r io.Reader) (*RIFFHeader, *VP8Header, *VP8FrameHeader, error) {
 	frame := make([]byte, vp8Header.PartSize)
 	n, err := r.Read(frame)
 	if err != nil {
-		return nil, nil, nil, NewFormatErrorf("error reading VP8 frame: %v", err)
+		return nil, nil, nil, nil, NewFormatErrorf("error reading VP8 frame: %v", err)
 	}
 	if n != int(vp8Header.PartSize) {
-		return nil, nil, nil, NewFormatErrorf("invalid VP8 frame: expected %d bytes, got %d", int(vp8Header.PartSize), n)
+		return nil, nil, nil, nil, NewFormatErrorf("invalid VP8 frame: expected %d bytes, got %d", int(vp8Header.PartSize), n)
 	}
 	d := compression.NewDecoder(frame)
 	if d == nil {
-		return nil, nil, nil, NewFormatError("invalid VP8 frame")
+		return nil, nil, nil, nil, NewFormatError("invalid VP8 frame")
 	}
 	decoder.first = d
 
@@ -79,10 +83,10 @@ func Decode(r io.Reader) (*RIFFHeader, *VP8Header, *VP8FrameHeader, error) {
 
 	vp8FrameHeader, err := decoder.decodeVP8Frame()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
-	return riffHeader, vp8Header, vp8FrameHeader, nil
+	return riffHeader, vp8Header, vp8FrameHeader, decoder.img, nil
 }
 
 func decodeRiffHeader(r io.Reader) (*RIFFHeader, error) {
@@ -278,6 +282,8 @@ type VP8FrameHeader struct {
 	Q_UV_DC int8
 	Q_UV_AC int8
 
+	Quant [4]quant
+
 	RefreshEntropy bool
 
 	NoSkipCoeff   bool
@@ -288,9 +294,20 @@ type VP8FrameHeader struct {
 	MBTop       []mb
 	MBLeft      mb
 	Macroblocks []*MacroBlock
+
+	YBR [26][32]uint8
+}
+
+type quant struct {
+	y1 [2]uint16
+	y2 [2]uint16
+	uv [2]uint16
 }
 
 func (d *decoder) decodeVP8Frame() (*VP8FrameHeader, error) {
+	m := image.NewYCbCr(image.Rect(0, 0, 16*int(d.vp8.MBWidth), 16*int(d.vp8.MBHeight)), image.YCbCrSubsampleRatio420)
+	d.img = m.SubImage(image.Rect(0, 0, int(d.vp8.Width), int(d.vp8.Height))).(*image.YCbCr)
+
 	fc := &VP8FrameHeader{}
 	d.fc = fc
 
@@ -454,6 +471,28 @@ func (d *decoder) decodeVP8QuantIndices() {
 	if d.first.ReadFlag() {
 		d.fc.Q_UV_AC = d.readSigned(d.first, 4)
 	}
+
+	for i := range 4 {
+		q := int32(d.fc.BaseQ)
+		if d.fc.UseSegment {
+			if d.fc.SegmentMode == SEGMODE_DELTA {
+				q += int32(d.fc.Quantizer[i])
+			} else {
+				q = int32(d.fc.Quantizer[i])
+			}
+		}
+
+		d.fc.Quant[i].y1[0] = dequantTableDC[clip(q+int32(d.fc.Q_Y1_DC), 0, 127)]
+		d.fc.Quant[i].y1[1] = dequantTableAC[clip(q, 0, 127)]
+		d.fc.Quant[i].y2[0] = dequantTableDC[clip(q+int32(d.fc.Q_Y2_DC), 0, 127)] * 2
+		d.fc.Quant[i].y2[1] = dequantTableAC[clip(q+int32(d.fc.Q_Y2_AC), 0, 127)] * 155 / 100
+		if d.fc.Quant[i].y2[1] < 8 {
+			d.fc.Quant[i].y2[1] = 8
+		}
+
+		d.fc.Quant[i].uv[0] = dequantTableDC[clip(q+int32(d.fc.Q_UV_DC), 0, 117)]
+		d.fc.Quant[i].uv[1] = dequantTableAC[clip(q+int32(d.fc.Q_UV_AC), 0, 127)]
+	}
 }
 
 func (d *decoder) readSigned(decoder *compression.Decoder, l int) int8 {
@@ -483,130 +522,149 @@ func (d *decoder) tokenProbUpdate() {
 }
 
 type MacroBlock struct {
-	SegmentId int8
+	SegmentId int
 	SkipCoef  bool
 
-	Luma       int8
-	LumaBModes [4][4]int8
+	UseLuma16  bool
+	Luma16     uint8
+	LumaBModes [4][4]uint8
 
 	Chroma int8
 
-	Coeffs [400]uint16
+	Coeffs [400]int16
 }
 
 type mb struct {
-	pred   [4]int8
+	pred   [4]uint8
 	nzMask uint8
 	nzY16  uint8
 }
 
+func (d *decoder) lumaMode(x int, mb *MacroBlock) {
+	mb.UseLuma16 = d.first.ReadFlagProb(145)
+	if mb.UseLuma16 {
+		var p uint8
+		if !d.first.ReadFlagProb(156) {
+			if !d.first.ReadFlagProb(163) {
+				p = predDC
+			} else {
+				p = predVE
+			}
+		} else if !d.first.ReadFlagProb(128) {
+			p = predHE
+		} else {
+			p = predTM
+		}
+		for i := 0; i < 4; i++ {
+			d.fc.MBTop[x].pred[i] = p
+			d.fc.MBLeft.pred[i] = p
+		}
+		mb.Luma16 = p
+	} else {
+		for j := range 4 {
+			p := d.fc.MBLeft.pred[j]
+			for i := range 4 {
+				prob := &kfBmodeProb[d.fc.MBTop[x].pred[i]][p]
+
+				if !d.first.ReadFlagProb(prob[0]) {
+					p = predDC
+				} else if !d.first.ReadFlagProb(prob[1]) {
+					p = predTM
+				} else if !d.first.ReadFlagProb(prob[2]) {
+					p = predVE
+				} else if !d.first.ReadFlagProb(prob[3]) {
+					if !d.first.ReadFlagProb(prob[4]) {
+						p = predHE
+					} else if !d.first.ReadFlagProb(prob[5]) {
+						p = predRD
+					} else {
+						p = predVR
+					}
+				} else if !d.first.ReadFlagProb(prob[6]) {
+					p = predLD
+				} else if !d.first.ReadFlagProb(prob[7]) {
+					p = predVL
+				} else if !d.first.ReadFlagProb(prob[8]) {
+					p = predHD
+				} else {
+					p = predHU
+				}
+				mb.LumaBModes[j][i] = p
+				d.fc.MBTop[x].pred[i] = p
+			}
+			d.fc.MBLeft.pred[j] = p
+		}
+	}
+}
+
 func (d *decoder) recontruct(x, y int) *MacroBlock {
+	if y == 0 {
+		fmt.Printf("%+v\n", d.fc.MBLeft)
+	}
+
 	mb := &MacroBlock{}
 
-	if d.fc.UseSegment && d.fc.UpdateMap {
-		mb.SegmentId = decodeTree(d.first, mbSegmentTree[:], d.fc.ProbSegment[:])
+	if d.fc.UpdateMap {
+		if !d.first.ReadFlagProb(d.fc.ProbSegment[0]) {
+			mb.SegmentId = int(d.first.ReadProb(1, d.fc.ProbSegment[1]))
+		} else {
+			mb.SegmentId = int(d.first.ReadProb(1, d.fc.ProbSegment[2])) + 2
+		}
 	}
 
 	if d.fc.NoSkipCoeff {
 		mb.SkipCoef = d.first.ReadFlagProb(d.fc.ProbSkipFalse)
 	}
 
-	mb.Luma = decodeTree(d.first, kfYmodeTree[:], kfYmodeProb[:])
+	d.prepareYBR(x, y)
 
-	mb.LumaBModes = [4][4]int8{}
-	switch mb.Luma {
-	case B_PRED:
-		for j := range 4 {
-			a := int8(d.fc.MBLeft.pred[j])
-			for i := range 4 {
-				if i > 0 {
-					a = mb.LumaBModes[j][i-1]
-				}
-				l := int8(d.fc.MBTop[x].pred[i])
-				if j > 0 {
-					l = mb.LumaBModes[j-1][i]
-				}
-				mb.LumaBModes[j][i] = decodeTree(d.first, bmodeTree[:], kfBmodeProb[l][a][:])
-			}
-		}
-	case DC_PRED:
-		for j := range 4 {
-			for i := range 4 {
-				mb.LumaBModes[j][i] = B_DC_PRED
-			}
-		}
-	case V_PRED:
-		for j := range 4 {
-			for i := range 4 {
-				mb.LumaBModes[j][i] = B_VE_PRED
-			}
-		}
-	case H_PRED:
-		for j := range 4 {
-			for i := range 4 {
-				mb.LumaBModes[j][i] = B_HE_PRED
-			}
-		}
-	case TM_PRED:
-		for j := range 4 {
-			for i := range 4 {
-				mb.LumaBModes[j][i] = B_TM_PRED
-			}
-		}
+	d.lumaMode(x, mb)
+
+	if !d.first.ReadFlagProb(142) {
+		mb.Chroma = predDC
+	} else if !d.first.ReadFlagProb(114) {
+		mb.Chroma = predVE
+	} else if !d.first.ReadFlagProb(183) {
+		mb.Chroma = predHE
+	} else {
+		mb.Chroma = predTM
 	}
 
-	d.fc.MBLeft.pred = [4]int8{
-		mb.LumaBModes[0][0],
-		mb.LumaBModes[0][1],
-		mb.LumaBModes[0][2],
-		mb.LumaBModes[0][3],
-	}
-	d.fc.MBTop[x].pred = [4]int8{
-		mb.LumaBModes[0][3],
-		mb.LumaBModes[1][3],
-		mb.LumaBModes[2][3],
-		mb.LumaBModes[3][3],
-	}
-
-	mb.Chroma = decodeTree(d.first, uvModeTree[:], uvModeProb[:])
-
-	base := 0
-
-	yPlane := PLANE_Y0
 	if !mb.SkipCoef {
 		coefP := d.partitions[y&(int(d.fc.Partitions)-1)]
+		quant := d.fc.Quant[mb.SegmentId]
+		yPlane := PLANE_Y0
 
-		if mb.Luma != B_PRED {
+		if mb.UseLuma16 {
 			ctx := d.fc.MBLeft.nzY16 + d.fc.MBTop[x].nzY16
-			v := d.decodeToken(coefP, PLANE_Y2, ctx, base, mb)
-			base += 16
-			if v {
-				d.fc.MBLeft.nzY16 = 1
-				d.fc.MBTop[x].nzY16 = 1
-			} else {
-				d.fc.MBLeft.nzY16 = 0
-				d.fc.MBTop[x].nzY16 = 0
-			}
+			nz := d.decodeResid(coefP, PLANE_Y2, ctx, 384, quant.y2, mb)
+			d.fc.MBLeft.nzY16 = nz
+			d.fc.MBTop[x].nzY16 = nz
+			d.inverseWHT16(mb)
 			yPlane = PLANE_Y1
 		}
+
+		base := 0
+		var nzDC, nzAC [4]uint8
+		var nzDCMask, nzACMask uint32
 
 		lnz := unpack[d.fc.MBLeft.nzMask&0x0f]
 		unz := unpack[d.fc.MBTop[x].nzMask&0x0f]
 		for j := range 4 {
 			nz := lnz[j]
 			for i := range 4 {
-				v := d.decodeToken(coefP, yPlane, nz+unz[i], base, mb)
+				nz = d.decodeResid(coefP, yPlane, nz+unz[i], base, quant.y1, mb)
+				unz[i] = nz
+				nzAC[i] = nz
+				nzDC[i] = btou(mb.Coeffs[base] != 0)
 				base += 16
-				if v {
-					unz[i], nz = 1, 1
-				} else {
-					unz[i], nz = 0, 0
-				}
 			}
 			lnz[j] = nz
+			nzDCMask |= pack(nzDC, j*4)
+			nzACMask |= pack(nzAC, j*4)
 		}
-		lnzMask := lnz[0] | lnz[1]<<1 | lnz[2]<<2 | lnz[3]<<3
-		unzMask := unz[0] | unz[1]<<1 | unz[2]<<2 | unz[3]<<3
+		lnzMask := pack(lnz, 0)
+		unzMask := pack(unz, 0)
 
 		lnz = unpack[d.fc.MBLeft.nzMask>>4]
 		unz = unpack[d.fc.MBTop[x].nzMask>>4]
@@ -614,116 +672,317 @@ func (d *decoder) recontruct(x, y int) *MacroBlock {
 			for j := range 2 {
 				nz := lnz[j+c]
 				for i := range 2 {
-					v := d.decodeToken(coefP, PLANE_UorV, nz+unz[i+c], base, mb)
+					nz = d.decodeResid(coefP, PLANE_UorV, nz+unz[i+c], base, quant.uv, mb)
+					unz[i+c] = nz
+					nzAC[j*2+i] = nz
+					nzDC[j*2+i] = btou(mb.Coeffs[base] != 0)
 					base += 16
-					if v {
-						unz[i], nz = 1, 1
-					} else {
-						unz[i], nz = 0, 0
-					}
 				}
 				lnz[j+c] = nz
 			}
+			nzDCMask |= pack(nzDC, 16+c*2)
+			nzACMask |= pack(nzAC, 16+c*2)
 		}
-		lnzMask |= (lnz[0] | lnz[1]<<1 | lnz[2]<<2 | lnz[3]<<3) << 4
-		unzMask |= (unz[0] | unz[1]<<1 | unz[2]<<2 | unz[3]<<3) << 4
+		lnzMask |= pack(lnz, 4)
+		unzMask |= pack(unz, 4)
 
-		d.fc.MBLeft.nzMask = lnzMask
-		d.fc.MBTop[x].nzMask = unzMask
+		d.fc.MBLeft.nzMask = uint8(lnzMask)
+		d.fc.MBTop[x].nzMask = uint8(unzMask)
+		d.nzDCMask = nzDCMask
+		d.nzACMask = nzACMask
+
+		mb.SkipCoef = nzDCMask == 0 && nzACMask == 0
 	} else {
-		if mb.Luma != B_PRED {
+		if mb.UseLuma16 {
 			d.fc.MBLeft.nzY16 = 0
 			d.fc.MBTop[x].nzY16 = 0
 		}
 
 		d.fc.MBLeft.nzMask = 0
 		d.fc.MBTop[x].nzMask = 0
+		d.nzDCMask = 0
+		d.nzACMask = 0
 	}
+
+	d.reconstructMB(x, y, mb)
 
 	d.fc.Macroblocks = append(d.fc.Macroblocks, mb)
 	return mb
 }
 
-func (d *decoder) dctExtra(decoder *compression.Decoder, prob []uint8) int8 {
-	pos := 0
-	v := decoder.Read8Prob(1, prob[pos])
-	pos++
-
-	for ; prob[pos] > 0; pos++ {
-		v += decoder.Read8Prob(1, prob[pos])
+func (d *decoder) decodeResid(decoder *compression.Decoder, plane, context uint8, base int, quant [2]uint16, mb *MacroBlock) uint8 {
+	prob, n := d.fc.CoeffProbs[plane], 0
+	if plane == 0 {
+		n = 1
 	}
 
-	iv := int8(v)
-	if iv != 0 && decoder.ReadFlag() {
-		iv = -iv
+	p := prob[coeffBands[n]][context]
+	if !decoder.ReadFlagProb(p[0]) {
+		return 0
 	}
 
-	return iv
+	for n != 16 {
+		n++
+		if !decoder.ReadFlagProb(p[1]) {
+			p = prob[coeffBands[n]][0]
+			continue
+		}
+
+		var v uint32
+		if !decoder.ReadFlagProb(p[2]) {
+			v = 1
+			p = prob[coeffBands[n]][1]
+		} else {
+			if !decoder.ReadFlagProb(p[3]) {
+				if !decoder.ReadFlagProb(p[4]) {
+					v = 2
+				} else {
+					v = 3 + decoder.ReadProb(1, p[5])
+				}
+			} else if !decoder.ReadFlagProb(p[6]) {
+				if !decoder.ReadFlagProb(p[7]) {
+					v = 5 + decoder.ReadProb(1, 159)
+				} else {
+					v = 7 + 2*decoder.ReadProb(1, 165) + decoder.ReadProb(1, 145)
+				}
+			} else {
+				b1 := decoder.ReadProb(1, p[8])
+				b0 := decoder.ReadProb(1, p[9+b1])
+				cat := 2*b1 + b0
+				tab := cat3456[cat]
+				v = 0
+				for i := 0; tab[i] != 0; i++ {
+					v *= 2
+					v += decoder.ReadProb(1, tab[i])
+				}
+				v += 3 + (8 << cat)
+			}
+			p = prob[coeffBands[n]][2]
+		}
+
+		z := zigzag[n-1]
+		c := int32(v) * int32(quant[btou(z > 0)])
+		if decoder.ReadFlag() {
+			c = -c
+		}
+		mb.Coeffs[base+int(z)] = int16(c)
+		if n == 16 || !decoder.ReadFlagProb(p[0]) {
+			return 1
+		}
+	}
+	return 1
 }
 
-func (d *decoder) decodeToken(decoder *compression.Decoder, plane, context uint8, base int, mb *MacroBlock) bool {
-	block := [16]int{}
-	var firstCoeff, ctx2 int
-	probTable := [11]uint8{}
-	var token, extraBits int8
-	var absValue int
-
-	prevCoeffZero := false
-	currentBlockCoeffs := false
-
-	categoryBase := [6]uint8{5, 7, 11, 19, 35, 67}
-
-	if plane == 1 {
-		firstCoeff++
+func (d *decoder) reconstructMB(mbx, mby int, mb *MacroBlock) {
+	if mb.UseLuma16 {
+		p := checkTopLeftPred(mbx, mby, uint8(mb.Luma16))
+		predFunc16[p](d, 1, 8)
+		for j := 0; j < 4; j++ {
+			for i := 0; i < 4; i++ {
+				n := 4*j + i
+				y := 4*j + 1
+				x := 4*i + 8
+				mask := uint32(1) << uint(n)
+				if d.nzACMask&mask != 0 {
+					d.inverseDCT4(y, x, 16*n, mb)
+				} else if d.nzDCMask&mask != 0 {
+					d.inverseDCT4DCOnly(y, x, 16*n, mb)
+				}
+			}
+		}
+	} else {
+		for j := 0; j < 4; j++ {
+			for i := 0; i < 4; i++ {
+				n := 4*j + i
+				y := 4*j + 1
+				x := 4*i + 8
+				predFunc4[mb.LumaBModes[j][i]](d, y, x)
+				mask := uint32(1) << uint(n)
+				if d.nzACMask&mask != 0 {
+					d.inverseDCT4(y, x, 16*n, mb)
+				} else if d.nzDCMask&mask != 0 {
+					d.inverseDCT4DCOnly(y, x, 16*n, mb)
+				}
+			}
+		}
 	}
 
-	for i := firstCoeff; i < 16; i++ {
-		ctx2 = coeffBands[i]
-		probTable = d.fc.CoeffProbs[plane][ctx2][context]
+	p := checkTopLeftPred(mbx, mby, uint8(mb.Chroma))
 
-		if prevCoeffZero {
-			token = decodeTree(decoder, coeffTreeNoEOB[:], probTable[:])
-		} else {
-			token = decodeTree(decoder, coeffTree[:], probTable[:])
-		}
-
-		if token == dct_eob {
-			break
-		}
-
-		if token != DCT_0 {
-			currentBlockCoeffs = true
-
-			if token >= dct_cat1 && token <= dct_cat6 {
-				catbase := int8(math.Abs(float64(token))) - dct_cat1
-				extraBits = d.dctExtra(decoder, pCatBases[catbase])
-				absValue = int(categoryBase[catbase]) + int(extraBits)
-			} else {
-				absValue = int(math.Abs(float64(token)))
-			}
-
-			if decoder.ReadFlag() {
-				block[i] = -absValue
-			} else {
-				block[i] = absValue
-			}
-
-			mb.Coeffs[base+int(zigzag[i])] = uint16(block[i])
-		} else {
-			absValue = int(math.Abs(float64(token)))
-		}
-
-		if absValue == 0 {
-			context = 0
-		} else if absValue == 1 {
-			context = 1
-		} else {
-			context = 2
-		}
-		prevCoeffZero = true
+	predFunc8[p](d, 18, 8)
+	if d.nzACMask&0x0f0000 != 0 {
+		d.inverseDCT8(18, 8, 256, mb)
+	} else if d.nzDCMask&0x0f0000 != 0 {
+		d.inverseDCT8DCOnly(18, 8, 256, mb)
 	}
 
-	return currentBlockCoeffs
+	predFunc8[p](d, 18, 24)
+	if d.nzACMask&0xf00000 != 0 {
+		d.inverseDCT8(18, 24, 320, mb)
+	} else if d.nzDCMask&0xf00000 != 0 {
+		d.inverseDCT8DCOnly(18, 24, 320, mb)
+	}
+
+	for i, j := (mby*d.img.YStride+mbx)*16, 0; j < 16; i, j = i+d.img.YStride, j+1 {
+		copy(d.img.Y[i:i+16], d.fc.YBR[1+j][8:24])
+	}
+	for i, j := (mby*d.img.CStride+mbx)*8, 0; j < 8; i, j = i+d.img.CStride, j+1 {
+		copy(d.img.Cb[i:i+8], d.fc.YBR[18+j][8:16])
+		copy(d.img.Cr[i:i+8], d.fc.YBR[18+j][24:32])
+	}
+}
+
+func (d *decoder) inverseWHT16(mb *MacroBlock) {
+	var m [16]int32
+	out := 0
+
+	for i := range 4 {
+		a1 := int32(mb.Coeffs[384+0+i]) + int32(mb.Coeffs[384+12+i])
+		b1 := int32(mb.Coeffs[384+4+i]) + int32(mb.Coeffs[384+8+i])
+		c1 := int32(mb.Coeffs[384+4+i]) - int32(mb.Coeffs[384+8+i])
+		d1 := int32(mb.Coeffs[384+0+i]) - int32(mb.Coeffs[384+12+i])
+		m[i] = a1 + b1
+		m[i+8] = a1 - b1
+		m[i+4] = d1 + c1
+		m[i+12] = d1 - c1
+	}
+
+	for i := range 4 {
+		dc := m[i*4] + 3
+
+		a1 := dc + m[3+i*4]
+		b1 := m[1+i*4] + m[2+i*4]
+		c1 := m[1+i*4] - m[2+i*4]
+		d1 := dc - m[3+i*4]
+
+		mb.Coeffs[out] = int16((a1 + b1) >> 3)
+		mb.Coeffs[out+16] = int16((d1 + c1) >> 3)
+		mb.Coeffs[out+32] = int16((a1 - b1) >> 3)
+		mb.Coeffs[out+48] = int16((d1 - c1) >> 3)
+
+		out += 64
+	}
+}
+
+func (z *decoder) inverseDCT4(y, x, coeffBase int, mb *MacroBlock) {
+	const (
+		c1 = 85627 // 65536 * cos(pi/8) * sqrt(2).
+		c2 = 35468 // 65536 * sin(pi/8) * sqrt(2).
+	)
+	var m [4][4]int32
+	for i := 0; i < 4; i++ {
+		a := int32(mb.Coeffs[coeffBase+0]) + int32(mb.Coeffs[coeffBase+8])
+		b := int32(mb.Coeffs[coeffBase+0]) - int32(mb.Coeffs[coeffBase+8])
+		c := (int32(mb.Coeffs[coeffBase+4])*c2)>>16 - (int32(mb.Coeffs[coeffBase+12])*c1)>>16
+		d := (int32(mb.Coeffs[coeffBase+4])*c1)>>16 + (int32(mb.Coeffs[coeffBase+12])*c2)>>16
+		m[i][0] = a + d
+		m[i][1] = b + c
+		m[i][2] = b - c
+		m[i][3] = a - d
+		coeffBase++
+	}
+	for j := 0; j < 4; j++ {
+		dc := m[0][j] + 4
+		a := dc + m[2][j]
+		b := dc - m[2][j]
+		c := (m[1][j]*c2)>>16 - (m[3][j]*c1)>>16
+		d := (m[1][j]*c1)>>16 + (m[3][j]*c2)>>16
+		z.fc.YBR[y+j][x+0] = clip8(int32(z.fc.YBR[y+j][x+0]) + (a+d)>>3)
+		z.fc.YBR[y+j][x+1] = clip8(int32(z.fc.YBR[y+j][x+1]) + (b+c)>>3)
+		z.fc.YBR[y+j][x+2] = clip8(int32(z.fc.YBR[y+j][x+2]) + (b-c)>>3)
+		z.fc.YBR[y+j][x+3] = clip8(int32(z.fc.YBR[y+j][x+3]) + (a-d)>>3)
+	}
+}
+
+func (z *decoder) inverseDCT4DCOnly(y, x, coeffBase int, mb *MacroBlock) {
+	dc := (int32(mb.Coeffs[coeffBase+0]) + 4) >> 3
+	for j := 0; j < 4; j++ {
+		for i := 0; i < 4; i++ {
+			z.fc.YBR[y+j][x+i] = clip8(int32(z.fc.YBR[y+j][x+i]) + dc)
+		}
+	}
+}
+
+func (z *decoder) inverseDCT8(y, x, coeffBase int, mb *MacroBlock) {
+	z.inverseDCT4(y+0, x+0, coeffBase+0*16, mb)
+	z.inverseDCT4(y+0, x+4, coeffBase+1*16, mb)
+	z.inverseDCT4(y+4, x+0, coeffBase+2*16, mb)
+	z.inverseDCT4(y+4, x+4, coeffBase+3*16, mb)
+}
+
+func (z *decoder) inverseDCT8DCOnly(y, x, coeffBase int, mb *MacroBlock) {
+	z.inverseDCT4DCOnly(y+0, x+0, coeffBase+0*16, mb)
+	z.inverseDCT4DCOnly(y+0, x+4, coeffBase+1*16, mb)
+	z.inverseDCT4DCOnly(y+4, x+0, coeffBase+2*16, mb)
+	z.inverseDCT4DCOnly(y+4, x+4, coeffBase+3*16, mb)
+}
+
+func clip8(i int32) uint8 {
+	if i < 0 {
+		return 0
+	}
+	if i > 255 {
+		return 255
+	}
+	return uint8(i)
+}
+
+func (d *decoder) prepareYBR(x, y int) {
+	if x == 0 {
+		for i := range 17 {
+			d.fc.YBR[i][7] = 0x81
+		}
+		for i := range 9 {
+			d.fc.YBR[17+i][7] = 0x81
+			d.fc.YBR[17+i][23] = 0x81
+		}
+	} else {
+		for i := range 17 {
+			d.fc.YBR[i][7] = d.fc.YBR[i][23]
+		}
+		for i := range 9 {
+			d.fc.YBR[17+i][7] = d.fc.YBR[17+i][15]
+			d.fc.YBR[17+i][23] = d.fc.YBR[17+i][31]
+		}
+	}
+
+	if y == 0 {
+		for i := range 21 {
+			d.fc.YBR[0][7+i] = 0x7f
+		}
+		for i := range 9 {
+			d.fc.YBR[17][7+i] = 0x7f
+		}
+		for i := range 9 {
+			d.fc.YBR[17][23+i] = 0x7f
+		}
+	} else {
+		for i := range 16 {
+			d.fc.YBR[0][8+i] = d.img.Y[(16*y-1)*d.img.YStride+16*x+i]
+		}
+		for i := range 8 {
+			d.fc.YBR[17][8+i] = d.img.Cb[(8*y-1)*d.img.CStride+8*x+i]
+		}
+		for i := range 8 {
+			d.fc.YBR[17][24+i] = d.img.Cr[(8*y-1)*d.img.CStride+8*x+i]
+		}
+		if x == int(d.vp8.MBWidth)-1 {
+			for i := range 4 {
+				d.fc.YBR[0][24+i] = d.img.Y[(16*y-1)*d.img.YStride+16*x+15]
+			}
+		} else {
+			for i := range 4 {
+				d.fc.YBR[0][24+i] = d.img.Y[(16*y-1)*d.img.YStride+16*x+(16+i)]
+			}
+		}
+	}
+
+	for i := 4; i < 16; i += 4 {
+		d.fc.YBR[i][24] = d.fc.YBR[0][24]
+		d.fc.YBR[i][25] = d.fc.YBR[0][25]
+		d.fc.YBR[i][26] = d.fc.YBR[0][26]
+		d.fc.YBR[i][27] = d.fc.YBR[0][27]
+	}
 }
 
 func decodeTree(decoder *compression.Decoder, tree []int8, p []uint8) int8 {
@@ -777,15 +1036,15 @@ const (
 )
 
 var bmodeTree = [18]int8{
-	-B_DC_PRED, 2,
-	-B_TM_PRED, 4,
-	-B_VE_PRED, 6,
+	-predDC, 2,
+	-predTM, 4,
+	-predVE, 6,
 	8, 12,
-	-B_HE_PRED, 10,
-	-B_RD_PRED, -B_VR_PRED,
-	-B_LD_PRED, 14,
-	-B_VL_PRED, 16,
-	-B_HD_PRED, -B_HU_PRED,
+	-predHE, 10,
+	-predRD, -predVR,
+	-predLD, 14,
+	-predVL, 16,
+	-predHD, -predHU,
 }
 
 var kfBmodeProb = [10][10][9]uint8{
@@ -794,9 +1053,9 @@ var kfBmodeProb = [10][10][9]uint8{
 		{152, 179, 64, 126, 170, 118, 46, 70, 95},
 		{175, 69, 143, 80, 85, 82, 72, 155, 103},
 		{56, 58, 10, 171, 218, 189, 17, 13, 152},
-		{144, 71, 10, 38, 171, 213, 144, 34, 26},
 		{114, 26, 17, 163, 44, 195, 21, 10, 173},
 		{121, 24, 80, 195, 26, 62, 44, 64, 85},
+		{144, 71, 10, 38, 171, 213, 144, 34, 26},
 		{170, 46, 55, 19, 136, 160, 33, 206, 71},
 		{63, 20, 8, 114, 114, 208, 12, 9, 226},
 		{81, 40, 11, 96, 182, 84, 29, 16, 36},
@@ -806,9 +1065,9 @@ var kfBmodeProb = [10][10][9]uint8{
 		{72, 187, 100, 130, 157, 111, 32, 75, 80},
 		{66, 102, 167, 99, 74, 62, 40, 234, 128},
 		{41, 53, 9, 178, 241, 141, 26, 8, 107},
-		{104, 79, 12, 27, 217, 255, 87, 17, 7},
 		{74, 43, 26, 146, 73, 166, 49, 23, 157},
 		{65, 38, 105, 160, 51, 52, 31, 115, 128},
+		{104, 79, 12, 27, 217, 255, 87, 17, 7},
 		{87, 68, 71, 44, 114, 51, 15, 186, 23},
 		{47, 41, 14, 110, 182, 183, 21, 17, 194},
 		{66, 45, 25, 102, 197, 189, 23, 18, 22},
@@ -818,9 +1077,9 @@ var kfBmodeProb = [10][10][9]uint8{
 		{43, 97, 183, 117, 85, 38, 35, 179, 61},
 		{39, 53, 200, 87, 26, 21, 43, 232, 171},
 		{56, 34, 51, 104, 114, 102, 29, 93, 77},
-		{107, 54, 32, 26, 51, 1, 81, 43, 31},
 		{39, 28, 85, 171, 58, 165, 90, 98, 64},
 		{34, 22, 116, 206, 23, 34, 43, 166, 73},
+		{107, 54, 32, 26, 51, 1, 81, 43, 31},
 		{68, 25, 106, 22, 64, 171, 36, 225, 114},
 		{34, 19, 21, 102, 132, 188, 16, 76, 124},
 		{62, 18, 78, 95, 85, 57, 50, 48, 51},
@@ -830,33 +1089,21 @@ var kfBmodeProb = [10][10][9]uint8{
 		{60, 148, 31, 172, 219, 228, 21, 18, 111},
 		{112, 113, 77, 85, 179, 255, 38, 120, 114},
 		{40, 42, 1, 196, 245, 209, 10, 25, 109},
-		{100, 80, 8, 43, 154, 1, 51, 26, 71},
 		{88, 43, 29, 140, 166, 213, 37, 43, 154},
 		{61, 63, 30, 155, 67, 45, 68, 1, 209},
+		{100, 80, 8, 43, 154, 1, 51, 26, 71},
 		{142, 78, 78, 16, 255, 128, 34, 197, 171},
 		{41, 40, 5, 102, 211, 183, 4, 1, 221},
 		{51, 50, 17, 168, 209, 192, 23, 25, 82},
-	},
-	{
-		{125, 98, 42, 88, 104, 85, 117, 175, 82},
-		{95, 84, 53, 89, 128, 100, 113, 101, 45},
-		{75, 79, 123, 47, 51, 128, 81, 171, 1},
-		{57, 17, 5, 71, 102, 57, 53, 41, 49},
-		{115, 21, 2, 10, 102, 255, 166, 23, 6},
-		{38, 33, 13, 121, 57, 73, 26, 1, 85},
-		{41, 10, 67, 138, 77, 110, 90, 47, 114},
-		{101, 29, 16, 10, 85, 128, 101, 196, 26},
-		{57, 18, 10, 102, 102, 213, 34, 20, 43},
-		{117, 20, 15, 36, 163, 128, 68, 1, 26},
 	},
 	{
 		{138, 31, 36, 171, 27, 166, 38, 44, 229},
 		{67, 87, 58, 169, 82, 115, 26, 59, 179},
 		{63, 59, 90, 180, 59, 166, 93, 73, 154},
 		{40, 40, 21, 116, 143, 209, 34, 39, 175},
-		{57, 46, 22, 24, 128, 1, 54, 17, 37},
 		{47, 15, 16, 183, 34, 223, 49, 45, 183},
 		{46, 17, 33, 183, 6, 98, 15, 32, 183},
+		{57, 46, 22, 24, 128, 1, 54, 17, 37},
 		{65, 32, 73, 115, 28, 128, 23, 128, 205},
 		{40, 3, 9, 115, 51, 192, 18, 6, 223},
 		{87, 37, 9, 115, 59, 77, 64, 21, 47},
@@ -866,21 +1113,33 @@ var kfBmodeProb = [10][10][9]uint8{
 		{64, 90, 70, 205, 40, 41, 23, 26, 57},
 		{54, 57, 112, 184, 5, 41, 38, 166, 213},
 		{30, 34, 26, 133, 152, 116, 10, 32, 134},
-		{75, 32, 12, 51, 192, 255, 160, 43, 51},
 		{39, 19, 53, 221, 26, 114, 32, 73, 255},
 		{31, 9, 65, 234, 2, 15, 1, 118, 73},
+		{75, 32, 12, 51, 192, 255, 160, 43, 51},
 		{88, 31, 35, 67, 102, 85, 55, 186, 85},
 		{56, 21, 23, 111, 59, 205, 45, 37, 192},
 		{55, 38, 70, 124, 73, 102, 1, 34, 98},
+	},
+	{
+		{125, 98, 42, 88, 104, 85, 117, 175, 82},
+		{95, 84, 53, 89, 128, 100, 113, 101, 45},
+		{75, 79, 123, 47, 51, 128, 81, 171, 1},
+		{57, 17, 5, 71, 102, 57, 53, 41, 49},
+		{38, 33, 13, 121, 57, 73, 26, 1, 85},
+		{41, 10, 67, 138, 77, 110, 90, 47, 114},
+		{115, 21, 2, 10, 102, 255, 166, 23, 6},
+		{101, 29, 16, 10, 85, 128, 101, 196, 26},
+		{57, 18, 10, 102, 102, 213, 34, 20, 43},
+		{117, 20, 15, 36, 163, 128, 68, 1, 26},
 	},
 	{
 		{102, 61, 71, 37, 34, 53, 31, 243, 192},
 		{69, 60, 71, 38, 73, 119, 28, 222, 37},
 		{68, 45, 128, 34, 1, 47, 11, 245, 171},
 		{62, 17, 19, 70, 146, 85, 55, 62, 70},
-		{75, 15, 9, 9, 64, 255, 184, 119, 16},
 		{37, 43, 37, 154, 100, 163, 85, 160, 1},
 		{63, 9, 92, 136, 28, 64, 32, 201, 85},
+		{75, 15, 9, 9, 64, 255, 184, 119, 16},
 		{86, 6, 28, 5, 64, 255, 25, 248, 1},
 		{56, 8, 17, 132, 137, 255, 55, 116, 128},
 		{58, 15, 20, 82, 135, 57, 26, 121, 40},
@@ -890,9 +1149,9 @@ var kfBmodeProb = [10][10][9]uint8{
 		{51, 103, 44, 131, 131, 123, 31, 6, 158},
 		{86, 40, 64, 135, 148, 224, 45, 183, 128},
 		{22, 26, 17, 131, 240, 154, 14, 1, 209},
-		{83, 12, 13, 54, 192, 255, 68, 47, 28},
 		{45, 16, 21, 91, 64, 222, 7, 1, 197},
 		{56, 21, 39, 155, 60, 138, 23, 102, 213},
+		{83, 12, 13, 54, 192, 255, 68, 47, 28},
 		{85, 26, 85, 85, 128, 128, 32, 146, 171},
 		{18, 11, 7, 63, 144, 171, 4, 4, 246},
 		{35, 27, 10, 146, 174, 171, 12, 26, 128},
@@ -902,9 +1161,9 @@ var kfBmodeProb = [10][10][9]uint8{
 		{85, 126, 47, 87, 176, 51, 41, 20, 32},
 		{101, 75, 128, 139, 118, 146, 116, 128, 85},
 		{56, 41, 15, 176, 236, 85, 37, 9, 62},
-		{146, 36, 19, 30, 171, 255, 97, 27, 20},
 		{71, 30, 17, 119, 118, 255, 17, 18, 138},
 		{101, 38, 60, 138, 55, 70, 43, 26, 142},
+		{146, 36, 19, 30, 171, 255, 97, 27, 20},
 		{138, 45, 61, 62, 219, 1, 81, 188, 64},
 		{32, 41, 20, 117, 151, 142, 20, 21, 163},
 		{112, 19, 12, 61, 195, 128, 48, 4, 24},
@@ -912,9 +1171,9 @@ var kfBmodeProb = [10][10][9]uint8{
 }
 
 var uvModeTree = [6]int8{
-	-DC_PRED, 2,
-	-V_PRED, 4,
-	-H_PRED, -TM_PRED,
+	-predDC, 2,
+	-predVE, 4,
+	-predHE, -predTM,
 }
 var uvModeProb = [3]uint8{142, 114, 183}
 
@@ -933,33 +1192,6 @@ const (
 	dct_eob
 )
 
-var coeffTree = [22]int8{
-	-dct_eob, 2,
-	-DCT_0, 4,
-	-DCT_1, 6,
-	8, 12,
-	-DCT_2, 10,
-	-DCT_3, -DCT_4,
-	14, 16,
-	-dct_cat1, -dct_cat2,
-	18, 20,
-	-dct_cat3, -dct_cat4,
-	-dct_cat5, -dct_cat6,
-}
-
-var coeffTreeNoEOB = [20]int8{
-	-DCT_0, 4,
-	-DCT_1, 6,
-	8, 12,
-	-DCT_2, 10,
-	-DCT_3, -DCT_4,
-	14, 16,
-	-dct_cat1, -dct_cat2,
-	18, 20,
-	-dct_cat3, -dct_cat4,
-	-dct_cat5, -dct_cat6,
-}
-
 var Pcat1 = [2]uint8{159, 0}
 var Pcat2 = [3]uint8{165, 145, 0}
 var Pcat3 = [4]uint8{173, 148, 140, 0}
@@ -967,16 +1199,14 @@ var Pcat4 = [5]uint8{176, 155, 140, 135, 0}
 var Pcat5 = [6]uint8{180, 157, 141, 134, 130, 0}
 var Pcat6 = [12]uint8{254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129, 0}
 
-var pCatBases = [6][]uint8{
-	Pcat1[:],
-	Pcat2[:],
-	Pcat3[:],
-	Pcat4[:],
-	Pcat5[:],
-	Pcat6[:],
+var cat3456 = [4][12]uint8{
+	{173, 148, 140, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{176, 155, 140, 135, 0, 0, 0, 0, 0, 0, 0, 0},
+	{180, 157, 141, 134, 130, 0, 0, 0, 0, 0, 0, 0},
+	{254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129, 0},
 }
 
-var coeffBands = [16]int{0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7}
+var coeffBands = [17]int{0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 0}
 
 const (
 	PLANE_Y1 uint8 = iota
@@ -1347,3 +1577,572 @@ var unpack = [16][4]uint8{
 }
 
 var zigzag = [16]uint8{0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15}
+
+func btou(b bool) uint8 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func pack(x [4]uint8, shift int) uint32 {
+	u := uint32(x[0])<<0 | uint32(x[1])<<1 | uint32(x[2])<<2 | uint32(x[3])<<3
+	return u << uint(shift)
+}
+
+func clip(x, min, max int32) int32 {
+	if x < min {
+		return min
+	}
+	if x > max {
+		return max
+	}
+	return x
+}
+
+var (
+	dequantTableDC = [128]uint16{
+		4, 5, 6, 7, 8, 9, 10, 10,
+		11, 12, 13, 14, 15, 16, 17, 17,
+		18, 19, 20, 20, 21, 21, 22, 22,
+		23, 23, 24, 25, 25, 26, 27, 28,
+		29, 30, 31, 32, 33, 34, 35, 36,
+		37, 37, 38, 39, 40, 41, 42, 43,
+		44, 45, 46, 46, 47, 48, 49, 50,
+		51, 52, 53, 54, 55, 56, 57, 58,
+		59, 60, 61, 62, 63, 64, 65, 66,
+		67, 68, 69, 70, 71, 72, 73, 74,
+		75, 76, 76, 77, 78, 79, 80, 81,
+		82, 83, 84, 85, 86, 87, 88, 89,
+		91, 93, 95, 96, 98, 100, 101, 102,
+		104, 106, 108, 110, 112, 114, 116, 118,
+		122, 124, 126, 128, 130, 132, 134, 136,
+		138, 140, 143, 145, 148, 151, 154, 157,
+	}
+	dequantTableAC = [128]uint16{
+		4, 5, 6, 7, 8, 9, 10, 11,
+		12, 13, 14, 15, 16, 17, 18, 19,
+		20, 21, 22, 23, 24, 25, 26, 27,
+		28, 29, 30, 31, 32, 33, 34, 35,
+		36, 37, 38, 39, 40, 41, 42, 43,
+		44, 45, 46, 47, 48, 49, 50, 51,
+		52, 53, 54, 55, 56, 57, 58, 60,
+		62, 64, 66, 68, 70, 72, 74, 76,
+		78, 80, 82, 84, 86, 88, 90, 92,
+		94, 96, 98, 100, 102, 104, 106, 108,
+		110, 112, 114, 116, 119, 122, 125, 128,
+		131, 134, 137, 140, 143, 146, 149, 152,
+		155, 158, 161, 164, 167, 170, 173, 177,
+		181, 185, 189, 193, 197, 201, 205, 209,
+		213, 217, 221, 225, 229, 234, 239, 245,
+		249, 254, 259, 264, 269, 274, 279, 284,
+	}
+)
+
+const (
+	predDC = iota
+	predTM
+	predVE
+	predHE
+	predRD
+	predVR
+	predLD
+	predVL
+	predHD
+	predHU
+	predDCTop
+	predDCLeft
+	predDCTopLeft
+)
+
+func checkTopLeftPred(mbx, mby int, p uint8) uint8 {
+	if p != predDC {
+		return p
+	}
+	if mbx == 0 {
+		if mby == 0 {
+			return predDCTopLeft
+		}
+		return predDCLeft
+	}
+	if mby == 0 {
+		return predDCTop
+	}
+	return predDC
+}
+
+var predFunc4 = [...]func(*decoder, int, int){
+	predFunc4DC,
+	predFunc4TM,
+	predFunc4VE,
+	predFunc4HE,
+	predFunc4RD,
+	predFunc4VR,
+	predFunc4LD,
+	predFunc4VL,
+	predFunc4HD,
+	predFunc4HU,
+	nil,
+	nil,
+	nil,
+}
+
+var predFunc8 = [...]func(*decoder, int, int){
+	predFunc8DC,
+	predFunc8TM,
+	predFunc8VE,
+	predFunc8HE,
+	nil,
+	nil,
+	nil,
+	nil,
+	nil,
+	nil,
+	predFunc8DCTop,
+	predFunc8DCLeft,
+	predFunc8DCTopLeft,
+}
+
+var predFunc16 = [...]func(*decoder, int, int){
+	predFunc16DC,
+	predFunc16TM,
+	predFunc16VE,
+	predFunc16HE,
+	nil,
+	nil,
+	nil,
+	nil,
+	nil,
+	nil,
+	predFunc16DCTop,
+	predFunc16DCLeft,
+	predFunc16DCTopLeft,
+}
+
+func predFunc4DC(z *decoder, y, x int) {
+	sum := uint32(4)
+	for i := 0; i < 4; i++ {
+		sum += uint32(z.fc.YBR[y-1][x+i])
+	}
+	for j := 0; j < 4; j++ {
+		sum += uint32(z.fc.YBR[y+j][x-1])
+	}
+	avg := uint8(sum / 8)
+	for j := 0; j < 4; j++ {
+		for i := 0; i < 4; i++ {
+			z.fc.YBR[y+j][x+i] = avg
+		}
+	}
+}
+
+func predFunc4TM(z *decoder, y, x int) {
+	delta0 := -int32(z.fc.YBR[y-1][x-1])
+	for j := 0; j < 4; j++ {
+		delta1 := delta0 + int32(z.fc.YBR[y+j][x-1])
+		for i := 0; i < 4; i++ {
+			delta2 := delta1 + int32(z.fc.YBR[y-1][x+i])
+			z.fc.YBR[y+j][x+i] = uint8(clip(delta2, 0, 255))
+		}
+	}
+}
+
+func predFunc4VE(z *decoder, y, x int) {
+	a := int32(z.fc.YBR[y-1][x-1])
+	b := int32(z.fc.YBR[y-1][x+0])
+	c := int32(z.fc.YBR[y-1][x+1])
+	d := int32(z.fc.YBR[y-1][x+2])
+	e := int32(z.fc.YBR[y-1][x+3])
+	f := int32(z.fc.YBR[y-1][x+4])
+	abc := uint8((a + 2*b + c + 2) / 4)
+	bcd := uint8((b + 2*c + d + 2) / 4)
+	cde := uint8((c + 2*d + e + 2) / 4)
+	def := uint8((d + 2*e + f + 2) / 4)
+	for j := 0; j < 4; j++ {
+		z.fc.YBR[y+j][x+0] = abc
+		z.fc.YBR[y+j][x+1] = bcd
+		z.fc.YBR[y+j][x+2] = cde
+		z.fc.YBR[y+j][x+3] = def
+	}
+}
+
+func predFunc4HE(z *decoder, y, x int) {
+	s := int32(z.fc.YBR[y+3][x-1])
+	r := int32(z.fc.YBR[y+2][x-1])
+	q := int32(z.fc.YBR[y+1][x-1])
+	p := int32(z.fc.YBR[y+0][x-1])
+	a := int32(z.fc.YBR[y-1][x-1])
+	ssr := uint8((s + 2*s + r + 2) / 4)
+	srq := uint8((s + 2*r + q + 2) / 4)
+	rqp := uint8((r + 2*q + p + 2) / 4)
+	apq := uint8((a + 2*p + q + 2) / 4)
+	for i := 0; i < 4; i++ {
+		z.fc.YBR[y+0][x+i] = apq
+		z.fc.YBR[y+1][x+i] = rqp
+		z.fc.YBR[y+2][x+i] = srq
+		z.fc.YBR[y+3][x+i] = ssr
+	}
+}
+
+func predFunc4RD(z *decoder, y, x int) {
+	s := int32(z.fc.YBR[y+3][x-1])
+	r := int32(z.fc.YBR[y+2][x-1])
+	q := int32(z.fc.YBR[y+1][x-1])
+	p := int32(z.fc.YBR[y+0][x-1])
+	a := int32(z.fc.YBR[y-1][x-1])
+	b := int32(z.fc.YBR[y-1][x+0])
+	c := int32(z.fc.YBR[y-1][x+1])
+	d := int32(z.fc.YBR[y-1][x+2])
+	e := int32(z.fc.YBR[y-1][x+3])
+	srq := uint8((s + 2*r + q + 2) / 4)
+	rqp := uint8((r + 2*q + p + 2) / 4)
+	qpa := uint8((q + 2*p + a + 2) / 4)
+	pab := uint8((p + 2*a + b + 2) / 4)
+	abc := uint8((a + 2*b + c + 2) / 4)
+	bcd := uint8((b + 2*c + d + 2) / 4)
+	cde := uint8((c + 2*d + e + 2) / 4)
+	z.fc.YBR[y+0][x+0] = pab
+	z.fc.YBR[y+0][x+1] = abc
+	z.fc.YBR[y+0][x+2] = bcd
+	z.fc.YBR[y+0][x+3] = cde
+	z.fc.YBR[y+1][x+0] = qpa
+	z.fc.YBR[y+1][x+1] = pab
+	z.fc.YBR[y+1][x+2] = abc
+	z.fc.YBR[y+1][x+3] = bcd
+	z.fc.YBR[y+2][x+0] = rqp
+	z.fc.YBR[y+2][x+1] = qpa
+	z.fc.YBR[y+2][x+2] = pab
+	z.fc.YBR[y+2][x+3] = abc
+	z.fc.YBR[y+3][x+0] = srq
+	z.fc.YBR[y+3][x+1] = rqp
+	z.fc.YBR[y+3][x+2] = qpa
+	z.fc.YBR[y+3][x+3] = pab
+}
+
+func predFunc4VR(z *decoder, y, x int) {
+	r := int32(z.fc.YBR[y+2][x-1])
+	q := int32(z.fc.YBR[y+1][x-1])
+	p := int32(z.fc.YBR[y+0][x-1])
+	a := int32(z.fc.YBR[y-1][x-1])
+	b := int32(z.fc.YBR[y-1][x+0])
+	c := int32(z.fc.YBR[y-1][x+1])
+	d := int32(z.fc.YBR[y-1][x+2])
+	e := int32(z.fc.YBR[y-1][x+3])
+	ab := uint8((a + b + 1) / 2)
+	bc := uint8((b + c + 1) / 2)
+	cd := uint8((c + d + 1) / 2)
+	de := uint8((d + e + 1) / 2)
+	rqp := uint8((r + 2*q + p + 2) / 4)
+	qpa := uint8((q + 2*p + a + 2) / 4)
+	pab := uint8((p + 2*a + b + 2) / 4)
+	abc := uint8((a + 2*b + c + 2) / 4)
+	bcd := uint8((b + 2*c + d + 2) / 4)
+	cde := uint8((c + 2*d + e + 2) / 4)
+	z.fc.YBR[y+0][x+0] = ab
+	z.fc.YBR[y+0][x+1] = bc
+	z.fc.YBR[y+0][x+2] = cd
+	z.fc.YBR[y+0][x+3] = de
+	z.fc.YBR[y+1][x+0] = pab
+	z.fc.YBR[y+1][x+1] = abc
+	z.fc.YBR[y+1][x+2] = bcd
+	z.fc.YBR[y+1][x+3] = cde
+	z.fc.YBR[y+2][x+0] = qpa
+	z.fc.YBR[y+2][x+1] = ab
+	z.fc.YBR[y+2][x+2] = bc
+	z.fc.YBR[y+2][x+3] = cd
+	z.fc.YBR[y+3][x+0] = rqp
+	z.fc.YBR[y+3][x+1] = pab
+	z.fc.YBR[y+3][x+2] = abc
+	z.fc.YBR[y+3][x+3] = bcd
+}
+
+func predFunc4LD(z *decoder, y, x int) {
+	a := int32(z.fc.YBR[y-1][x+0])
+	b := int32(z.fc.YBR[y-1][x+1])
+	c := int32(z.fc.YBR[y-1][x+2])
+	d := int32(z.fc.YBR[y-1][x+3])
+	e := int32(z.fc.YBR[y-1][x+4])
+	f := int32(z.fc.YBR[y-1][x+5])
+	g := int32(z.fc.YBR[y-1][x+6])
+	h := int32(z.fc.YBR[y-1][x+7])
+	abc := uint8((a + 2*b + c + 2) / 4)
+	bcd := uint8((b + 2*c + d + 2) / 4)
+	cde := uint8((c + 2*d + e + 2) / 4)
+	def := uint8((d + 2*e + f + 2) / 4)
+	efg := uint8((e + 2*f + g + 2) / 4)
+	fgh := uint8((f + 2*g + h + 2) / 4)
+	ghh := uint8((g + 2*h + h + 2) / 4)
+	z.fc.YBR[y+0][x+0] = abc
+	z.fc.YBR[y+0][x+1] = bcd
+	z.fc.YBR[y+0][x+2] = cde
+	z.fc.YBR[y+0][x+3] = def
+	z.fc.YBR[y+1][x+0] = bcd
+	z.fc.YBR[y+1][x+1] = cde
+	z.fc.YBR[y+1][x+2] = def
+	z.fc.YBR[y+1][x+3] = efg
+	z.fc.YBR[y+2][x+0] = cde
+	z.fc.YBR[y+2][x+1] = def
+	z.fc.YBR[y+2][x+2] = efg
+	z.fc.YBR[y+2][x+3] = fgh
+	z.fc.YBR[y+3][x+0] = def
+	z.fc.YBR[y+3][x+1] = efg
+	z.fc.YBR[y+3][x+2] = fgh
+	z.fc.YBR[y+3][x+3] = ghh
+}
+
+func predFunc4VL(z *decoder, y, x int) {
+	a := int32(z.fc.YBR[y-1][x+0])
+	b := int32(z.fc.YBR[y-1][x+1])
+	c := int32(z.fc.YBR[y-1][x+2])
+	d := int32(z.fc.YBR[y-1][x+3])
+	e := int32(z.fc.YBR[y-1][x+4])
+	f := int32(z.fc.YBR[y-1][x+5])
+	g := int32(z.fc.YBR[y-1][x+6])
+	h := int32(z.fc.YBR[y-1][x+7])
+	ab := uint8((a + b + 1) / 2)
+	bc := uint8((b + c + 1) / 2)
+	cd := uint8((c + d + 1) / 2)
+	de := uint8((d + e + 1) / 2)
+	abc := uint8((a + 2*b + c + 2) / 4)
+	bcd := uint8((b + 2*c + d + 2) / 4)
+	cde := uint8((c + 2*d + e + 2) / 4)
+	def := uint8((d + 2*e + f + 2) / 4)
+	efg := uint8((e + 2*f + g + 2) / 4)
+	fgh := uint8((f + 2*g + h + 2) / 4)
+	z.fc.YBR[y+0][x+0] = ab
+	z.fc.YBR[y+0][x+1] = bc
+	z.fc.YBR[y+0][x+2] = cd
+	z.fc.YBR[y+0][x+3] = de
+	z.fc.YBR[y+1][x+0] = abc
+	z.fc.YBR[y+1][x+1] = bcd
+	z.fc.YBR[y+1][x+2] = cde
+	z.fc.YBR[y+1][x+3] = def
+	z.fc.YBR[y+2][x+0] = bc
+	z.fc.YBR[y+2][x+1] = cd
+	z.fc.YBR[y+2][x+2] = de
+	z.fc.YBR[y+2][x+3] = efg
+	z.fc.YBR[y+3][x+0] = bcd
+	z.fc.YBR[y+3][x+1] = cde
+	z.fc.YBR[y+3][x+2] = def
+	z.fc.YBR[y+3][x+3] = fgh
+}
+
+func predFunc4HD(z *decoder, y, x int) {
+	s := int32(z.fc.YBR[y+3][x-1])
+	r := int32(z.fc.YBR[y+2][x-1])
+	q := int32(z.fc.YBR[y+1][x-1])
+	p := int32(z.fc.YBR[y+0][x-1])
+	a := int32(z.fc.YBR[y-1][x-1])
+	b := int32(z.fc.YBR[y-1][x+0])
+	c := int32(z.fc.YBR[y-1][x+1])
+	d := int32(z.fc.YBR[y-1][x+2])
+	sr := uint8((s + r + 1) / 2)
+	rq := uint8((r + q + 1) / 2)
+	qp := uint8((q + p + 1) / 2)
+	pa := uint8((p + a + 1) / 2)
+	srq := uint8((s + 2*r + q + 2) / 4)
+	rqp := uint8((r + 2*q + p + 2) / 4)
+	qpa := uint8((q + 2*p + a + 2) / 4)
+	pab := uint8((p + 2*a + b + 2) / 4)
+	abc := uint8((a + 2*b + c + 2) / 4)
+	bcd := uint8((b + 2*c + d + 2) / 4)
+	z.fc.YBR[y+0][x+0] = pa
+	z.fc.YBR[y+0][x+1] = pab
+	z.fc.YBR[y+0][x+2] = abc
+	z.fc.YBR[y+0][x+3] = bcd
+	z.fc.YBR[y+1][x+0] = qp
+	z.fc.YBR[y+1][x+1] = qpa
+	z.fc.YBR[y+1][x+2] = pa
+	z.fc.YBR[y+1][x+3] = pab
+	z.fc.YBR[y+2][x+0] = rq
+	z.fc.YBR[y+2][x+1] = rqp
+	z.fc.YBR[y+2][x+2] = qp
+	z.fc.YBR[y+2][x+3] = qpa
+	z.fc.YBR[y+3][x+0] = sr
+	z.fc.YBR[y+3][x+1] = srq
+	z.fc.YBR[y+3][x+2] = rq
+	z.fc.YBR[y+3][x+3] = rqp
+}
+
+func predFunc4HU(z *decoder, y, x int) {
+	s := int32(z.fc.YBR[y+3][x-1])
+	r := int32(z.fc.YBR[y+2][x-1])
+	q := int32(z.fc.YBR[y+1][x-1])
+	p := int32(z.fc.YBR[y+0][x-1])
+	pq := uint8((p + q + 1) / 2)
+	qr := uint8((q + r + 1) / 2)
+	rs := uint8((r + s + 1) / 2)
+	pqr := uint8((p + 2*q + r + 2) / 4)
+	qrs := uint8((q + 2*r + s + 2) / 4)
+	rss := uint8((r + 2*s + s + 2) / 4)
+	sss := uint8(s)
+	z.fc.YBR[y+0][x+0] = pq
+	z.fc.YBR[y+0][x+1] = pqr
+	z.fc.YBR[y+0][x+2] = qr
+	z.fc.YBR[y+0][x+3] = qrs
+	z.fc.YBR[y+1][x+0] = qr
+	z.fc.YBR[y+1][x+1] = qrs
+	z.fc.YBR[y+1][x+2] = rs
+	z.fc.YBR[y+1][x+3] = rss
+	z.fc.YBR[y+2][x+0] = rs
+	z.fc.YBR[y+2][x+1] = rss
+	z.fc.YBR[y+2][x+2] = sss
+	z.fc.YBR[y+2][x+3] = sss
+	z.fc.YBR[y+3][x+0] = sss
+	z.fc.YBR[y+3][x+1] = sss
+	z.fc.YBR[y+3][x+2] = sss
+	z.fc.YBR[y+3][x+3] = sss
+}
+
+func predFunc8DC(z *decoder, y, x int) {
+	sum := uint32(8)
+	for i := 0; i < 8; i++ {
+		sum += uint32(z.fc.YBR[y-1][x+i])
+	}
+	for j := 0; j < 8; j++ {
+		sum += uint32(z.fc.YBR[y+j][x-1])
+	}
+	avg := uint8(sum / 16)
+	for j := 0; j < 8; j++ {
+		for i := 0; i < 8; i++ {
+			z.fc.YBR[y+j][x+i] = avg
+		}
+	}
+}
+
+func predFunc8TM(z *decoder, y, x int) {
+	delta0 := -int32(z.fc.YBR[y-1][x-1])
+	for j := 0; j < 8; j++ {
+		delta1 := delta0 + int32(z.fc.YBR[y+j][x-1])
+		for i := 0; i < 8; i++ {
+			delta2 := delta1 + int32(z.fc.YBR[y-1][x+i])
+			z.fc.YBR[y+j][x+i] = uint8(clip(delta2, 0, 255))
+		}
+	}
+}
+
+func predFunc8VE(z *decoder, y, x int) {
+	for j := 0; j < 8; j++ {
+		for i := 0; i < 8; i++ {
+			z.fc.YBR[y+j][x+i] = z.fc.YBR[y-1][x+i]
+		}
+	}
+}
+
+func predFunc8HE(z *decoder, y, x int) {
+	for j := 0; j < 8; j++ {
+		for i := 0; i < 8; i++ {
+			z.fc.YBR[y+j][x+i] = z.fc.YBR[y+j][x-1]
+		}
+	}
+}
+
+func predFunc8DCTop(z *decoder, y, x int) {
+	sum := uint32(4)
+	for j := 0; j < 8; j++ {
+		sum += uint32(z.fc.YBR[y+j][x-1])
+	}
+	avg := uint8(sum / 8)
+	for j := 0; j < 8; j++ {
+		for i := 0; i < 8; i++ {
+			z.fc.YBR[y+j][x+i] = avg
+		}
+	}
+}
+
+func predFunc8DCLeft(z *decoder, y, x int) {
+	sum := uint32(4)
+	for i := 0; i < 8; i++ {
+		sum += uint32(z.fc.YBR[y-1][x+i])
+	}
+	avg := uint8(sum / 8)
+	for j := 0; j < 8; j++ {
+		for i := 0; i < 8; i++ {
+			z.fc.YBR[y+j][x+i] = avg
+		}
+	}
+}
+
+func predFunc8DCTopLeft(z *decoder, y, x int) {
+	for j := 0; j < 8; j++ {
+		for i := 0; i < 8; i++ {
+			z.fc.YBR[y+j][x+i] = 0x80
+		}
+	}
+}
+
+func predFunc16DC(z *decoder, y, x int) {
+	sum := uint32(16)
+	for i := 0; i < 16; i++ {
+		sum += uint32(z.fc.YBR[y-1][x+i])
+	}
+	for j := 0; j < 16; j++ {
+		sum += uint32(z.fc.YBR[y+j][x-1])
+	}
+	avg := uint8(sum / 32)
+	for j := 0; j < 16; j++ {
+		for i := 0; i < 16; i++ {
+			z.fc.YBR[y+j][x+i] = avg
+		}
+	}
+}
+
+func predFunc16TM(z *decoder, y, x int) {
+	delta0 := -int32(z.fc.YBR[y-1][x-1])
+	for j := 0; j < 16; j++ {
+		delta1 := delta0 + int32(z.fc.YBR[y+j][x-1])
+		for i := 0; i < 16; i++ {
+			delta2 := delta1 + int32(z.fc.YBR[y-1][x+i])
+			z.fc.YBR[y+j][x+i] = uint8(clip(delta2, 0, 255))
+		}
+	}
+}
+
+func predFunc16VE(z *decoder, y, x int) {
+	for j := 0; j < 16; j++ {
+		for i := 0; i < 16; i++ {
+			z.fc.YBR[y+j][x+i] = z.fc.YBR[y-1][x+i]
+		}
+	}
+}
+
+func predFunc16HE(z *decoder, y, x int) {
+	for j := 0; j < 16; j++ {
+		for i := 0; i < 16; i++ {
+			z.fc.YBR[y+j][x+i] = z.fc.YBR[y+j][x-1]
+		}
+	}
+}
+
+func predFunc16DCTop(z *decoder, y, x int) {
+	sum := uint32(8)
+	for j := 0; j < 16; j++ {
+		sum += uint32(z.fc.YBR[y+j][x-1])
+	}
+	avg := uint8(sum / 16)
+	for j := 0; j < 16; j++ {
+		for i := 0; i < 16; i++ {
+			z.fc.YBR[y+j][x+i] = avg
+		}
+	}
+}
+
+func predFunc16DCLeft(z *decoder, y, x int) {
+	sum := uint32(8)
+	for i := 0; i < 16; i++ {
+		sum += uint32(z.fc.YBR[y-1][x+i])
+	}
+	avg := uint8(sum / 16)
+	for j := 0; j < 16; j++ {
+		for i := 0; i < 16; i++ {
+			z.fc.YBR[y+j][x+i] = avg
+		}
+	}
+}
+
+func predFunc16DCTopLeft(z *decoder, y, x int) {
+	for j := 0; j < 16; j++ {
+		for i := 0; i < 16; i++ {
+			z.fc.YBR[y+j][x+i] = 0x80
+		}
+	}
+}
